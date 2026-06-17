@@ -3,6 +3,8 @@ import torch
 import torch.nn.functional as F
 import hashlib
 from tqdm import tqdm
+from comfy import model_management as mm
+from comfy.utils import common_upscale
 
 from .utils import(log, clip_encode_image_tiled, add_noise_to_reference_video, set_module_tensor_to_device)
 from .taehv import TAEHV
@@ -19,6 +21,102 @@ offload_device = mm.unet_offload_device()
 
 VAE_STRIDE = (4, 8, 8)
 PATCH_SIZE = (1, 2, 2)
+
+# 在文件顶部或合适的位置添加辅助函数
+def _resize_long_edge(image, max_size, stride=16):
+    """Resize (preserve aspect) so the long edge <= max_size, then snap each side to stride"""
+    h, w = image.shape[1], image.shape[2]
+    scale = min(max_size / max(h, w), 1.0)
+    nh = max(stride, round(h * scale / stride) * stride)
+    nw = max(stride, round(w * scale / stride) * stride)
+    # 保持 [T, C, H, W] 传给 common_upscale，然后转回 [T, H, W, C]
+    return common_upscale(image[:,:,:,:3].movedim(-1, 1), nw, nh, "area", "disabled").movedim(1, -1)
+
+
+# 2. 修正后的 Bernini 编码节点
+class WanVideoBerniniEncode:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "vae": ("WANVAE",),
+                "width": ("INT", {"default": 832, "min": 16, "max": 8192, "step": 16}),
+                "height": ("INT", {"default": 480, "min": 16, "max": 8192, "step": 16}),
+                "length": ("INT", {"default": 81, "min": 1, "max": 8192, "step": 4}),
+                "ref_max_size": ("INT", {"default": 848, "min": 16, "max": 8192, "step": 16, "tooltip": "Max size for the long edge of reference_video and reference_images."}),
+            },
+            "optional": {
+                "source_video": ("IMAGE", {"tooltip": "Source video to edit or restyle (v2v, rv2v). Resized to width/height."}),
+                "reference_video": ("IMAGE", {"tooltip": "Video to insert into the source video (ads2v)."}),
+                "reference_images": ("IMAGE", {"tooltip": "Reference images injected as in-context tokens (r2v, rv2v). Can be a batch."}),
+            }
+        }
+
+    RETURN_TYPES = ("WANVIDIMAGE_EMBEDS",)
+    RETURN_NAMES = ("image_embeds",)
+    FUNCTION = "process"
+    CATEGORY = "WanVideoWrapper"
+    DESCRIPTION = "Encodes source and reference videos/images for Bernini in-context conditioning."
+
+    def process(self, vae, width, height, length, ref_max_size, source_video=None, reference_video=None, reference_images=None):
+        context_latents = []
+        device = mm.get_torch_device()
+        offload_device = mm.unet_offload_device()
+        
+        # 【核心修正】：确保输出形状为 [1, C, T, H, W]
+        def encode_tensor(tensor):
+            # tensor 输入形状为 [T, H, W, C] 或 [1, H, W, C]
+            # permute(3, 0, 1, 2) 将其变为 [C, T, H, W]
+            # unsqueeze(0) 将其变为 [1, C, T, H, W]，这是 WanVideo VAE 期望的格式
+            t = tensor[..., :3].permute(3, 0, 1, 2).unsqueeze(0).to(device, vae.dtype) * 2.0 - 1.0
+            try:
+                # WanVideoWrapper 的 VAE encode 通常接受列表
+                lat = vae.encode([t], device=device)[0]
+            except Exception:
+                lat = vae.encode(t, device=device)
+                if isinstance(lat, dict):
+                    lat = lat["samples"]
+                if lat.dim() == 5:
+                    lat = lat[0]
+            return lat
+
+        vae.to(device)
+
+        # 1. Source Video (编辑基底，resize 到目标分辨率)
+        if source_video is not None:
+            # common_upscale 期望 [B, C, H, W]，所以先 movedim(-1, 1)
+            vid = common_upscale(source_video[:length, :, :, :3].movedim(-1, 1), width, height, "area", "center").movedim(1, -1)
+            context_latents.append(encode_tensor(vid))
+            
+        # 2. Reference Video (保持原生宽高比，长边限制)
+        if reference_video is not None:
+            ref_vid = _resize_long_edge(reference_video[:length], ref_max_size)
+            context_latents.append(encode_tensor(ref_vid))
+            
+        # 3. Reference Images (支持 Batch 输入，每张图作为一个独立的 context stream)
+        if reference_images is not None:
+            for i in range(reference_images.shape[0]):
+                img = _resize_long_edge(reference_images[i:i+1], ref_max_size)
+                context_latents.append(encode_tensor(img))
+                
+        vae.to(offload_device)
+        mm.soft_empty_cache()
+        
+        # 构建目标视频的 Shape 信息 (Wan 2.1/2.2 默认 16 channels)
+        lat_h = height // 8
+        lat_w = width // 8
+        lat_t = (length - 1) // 4 + 1
+        target_shape = (16, lat_t, lat_h, lat_w)
+        
+        embeds = {
+            "target_shape": target_shape,
+            "num_frames": length,
+            "lat_h": lat_h,
+            "lat_w": lat_w,
+            "context_latents": context_latents, # 核心：传递 context latents 列表给 Sampler
+            "has_ref": False, # 避免触发 Sampler 中其他 I2V/Fun 模型的 ref 逻辑
+        }
+        return (embeds,)
 
 
 class WanVideoEnhanceAVideo:
@@ -452,7 +550,8 @@ class WanVideoTextEncode:
             weights[text] = float(weight)
             
         return cleaned_prompt, weights
-    
+#class AddBerniniContext:
+
 class WanVideoTextEncodeSingle:
     @classmethod
     def INPUT_TYPES(s):
@@ -2331,6 +2430,7 @@ NODE_CLASS_MAPPINGS = {
     "WanVideoAddTTMLatents": WanVideoAddTTMLatents,
     "WanVideoAddStoryMemLatents": WanVideoAddStoryMemLatents,
     "WanVideoSVIProEmbeds": WanVideoSVIProEmbeds,
+    "WanVideoBerniniEncode": WanVideoBerniniEncode,
     }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -2373,4 +2473,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WanVideoAddTTMLatents": "WanVideo Add TTMLatents",
     "WanVideoAddStoryMemLatents": "WanVideo Add StoryMem Latents",
     "WanVideoSVIProEmbeds": "WanVideo SVIPro Embeds",
+    "WanVideoBerniniEncode": "WanVideo Bernini Encode",
 }
