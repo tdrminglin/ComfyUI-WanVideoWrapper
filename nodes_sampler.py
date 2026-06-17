@@ -221,8 +221,13 @@ class WanVideoSampler:
         phantom_latents = fun_ref_image = ATI_tracks = None
         add_cond = attn_cond = attn_cond_neg = noise_pred_flipped = None
         humo_audio = humo_audio_neg = None
-        has_ref = image_embeds.get("has_ref", False)
+        #has_ref = image_embeds.get("has_ref", False)
 
+        ######qwen3.7
+        has_ref = image_embeds.get("has_ref", False)
+        # Bernini In-context Reference Latents
+        context_latents = image_embeds.get("context_latents", None)
+        ######qwen3.7
         #I2V
         story_mem_latents = image_embeds.get("story_mem_latents", None)
         image_cond = image_embeds.get("image_embeds", None)
@@ -415,6 +420,8 @@ class WanVideoSampler:
 
         # CLIP image features
         clip_fea = image_embeds.get("clip_context", None)
+
+
         if clip_fea is not None:
             clip_fea = clip_fea.to(dtype)
         clip_fea_neg = image_embeds.get("negative_clip_context", None)
@@ -1174,7 +1181,7 @@ class WanVideoSampler:
                              add_cond=None, cache_state=None, context_window=None, multitalk_audio_embeds=None, fantasy_portrait_input=None, reverse_time=False,
                              mtv_motion_tokens=None, s2v_audio_input=None, s2v_ref_motion=None, s2v_motion_frames=[1, 0], s2v_pose=None,
                              humo_image_cond=None, humo_image_cond_neg=None, humo_audio=None, humo_audio_neg=None, wananim_pose_latents=None,
-                             wananim_face_pixels=None, uni3c_data=None, latent_model_input_ovi=None, flashvsr_LQ_latent=None,):
+                             wananim_face_pixels=None, uni3c_data=None, latent_model_input_ovi=None, flashvsr_LQ_latent=None,context_latents=None):#######qwen3.7
             nonlocal transformer
             nonlocal audio_cfg_scale
 
@@ -1432,7 +1439,12 @@ class WanVideoSampler:
                             dual_control_in["sparse_input_latent"] = dual_control_embeds["sparse_input_latent"][:, :, context_window]
                     else:
                         dual_control_in = dual_control_input
-
+                # Bernini Context Latents 处理 qwen3.7
+                context_latents_input = None
+                if context_latents is not None:
+                    # 将列表中的每个 latent tensor 移动到当前计算的 device 和 dtype
+                    context_latents_input = [lat.to(z.device, z.dtype) for lat in context_latents]
+                ########qwen3.7
                 base_params = {
                     'x': [z], # latent
                     'y': [image_cond_input] if image_cond_input is not None else None, # image cond
@@ -1496,6 +1508,7 @@ class WanVideoSampler:
                     "one_to_all_controlnet_strength": one_to_all_data["controlnet_strength"] if one_to_all_data is not None else 0.0,
                     "scail_input": scail_data_in, # SCAIL input
                     "dual_control_input": dual_control_in, # LongVie2 dual control input
+                    "context_latents": context_latents_input, # <--- 新增：传递给底层模型qwen3.7
                     "transformer_options": transformer_options,
                     "rope_negative_offset": image_embeds.get("rope_negative_offset_frames", 0), # StoryMem rope negative offset
                     "num_memory_frames": story_mem_latents.shape[1] if story_mem_latents is not None else 0, # StoryMem memory frames
@@ -2023,6 +2036,39 @@ class WanVideoSampler:
                                 partial_timestep = timestep
 
                             orig_model_input_frames = partial_latent_model_input.shape[1]
+                            # 【新增】Bernini Context Latents 时间切片逻辑qwen3.7
+                            partial_context_latents = None
+                            if context_latents is not None:
+                                partial_context_latents = []
+                                # c 是当前窗口的 latent frame indices 列表，例如 [0, 1, ..., 20]
+                                lat_start = min(c)
+                                lat_end = max(c) + 1
+                                
+                                for ref_lat in context_latents:
+                                    # 判断时间维度 (4D张量 T在dim=1, 5D张量 T在dim=2)
+                                    t_dim = 1 if ref_lat.dim() == 4 else 2 if ref_lat.dim() == 5 else -1
+                                    
+                                    if t_dim != -1 and ref_lat.shape[t_dim] > 1:
+                                        # 这是一个视频（如 source_video），进行同步切片
+                                        actual_end = min(lat_end, ref_lat.shape[t_dim])
+                                        actual_start = min(lat_start, actual_end)
+                                        if actual_end > actual_start:
+                                            if t_dim == 1:
+                                                sliced = ref_lat[:, actual_start:actual_end, :, :]
+                                            else:
+                                                sliced = ref_lat[:, :, actual_start:actual_end, :, :]
+                                        else:
+                                            # 越界保护：如果 Reference 比 Target 短，重复最后一帧
+                                            if t_dim == 1:
+                                                sliced = ref_lat[:, -1:, :, :].repeat(1, lat_end - lat_start, 1, 1)
+                                            else:
+                                                sliced = ref_lat[:, :, -1:, :, :].repeat(1, 1, lat_end - lat_start, 1, 1)
+                                    else:
+                                        # 这是一个单张图像（T=1）或未知维度，直接传递（模型会将其视为全局参考）
+                                        sliced = ref_lat
+                                        
+                                    partial_context_latents.append(sliced)
+                            ###qwen3.7
 
                             noise_pred_context, _, new_teacache = predict_with_cfg(
                                 partial_latent_model_input,
@@ -2033,7 +2079,7 @@ class WanVideoSampler:
                                 mtv_motion_tokens=partial_mtv_motion_tokens, s2v_audio_input=partial_s2v_audio_input, s2v_motion_frames=[1, 0], s2v_pose=partial_s2v_pose,
                                 humo_image_cond=humo_image_cond, humo_image_cond_neg=humo_image_cond_neg, humo_audio=humo_audio, humo_audio_neg=humo_audio_neg,
                                 wananim_face_pixels=partial_wananim_face_pixels, wananim_pose_latents=partial_wananim_pose_latents, multitalk_audio_embeds=multitalk_audio_embeds,
-                                uni3c_data=uni3c_data, flashvsr_LQ_latent=partial_flashvsr_LQ_latent)
+                                uni3c_data=uni3c_data, flashvsr_LQ_latent=partial_flashvsr_LQ_latent,context_latents=partial_context_latents)
 
                             if cache_args is not None:
                                 self.window_tracker.cache_states[window_id] = new_teacache
@@ -2502,6 +2548,7 @@ class WanVideoSampler:
                             cache_state=self.cache_state, fantasy_portrait_input=fantasy_portrait_input, multitalk_audio_embeds=multitalk_audio_embeds, mtv_motion_tokens=mtv_motion_tokens, s2v_audio_input=s2v_audio_input,
                             humo_image_cond=humo_image_cond, humo_image_cond_neg=humo_image_cond_neg, humo_audio=humo_audio, humo_audio_neg=humo_audio_neg,
                             wananim_face_pixels=wananim_face_pixels, wananim_pose_latents=wananim_pose_latents, uni3c_data = uni3c_data, latent_model_input_ovi=latent_model_input_ovi, flashvsr_LQ_latent=flashvsr_LQ_latent,
+                            context_latents=context_latents,#####qwen3.7
                         )
                         if bidirectional_sampling:
                             noise_pred_flipped, _,self.cache_state = predict_with_cfg(
