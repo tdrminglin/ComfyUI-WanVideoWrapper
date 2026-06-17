@@ -28,6 +28,17 @@ from ...MTV.mtv import apply_rotary_emb
 from comfy.ldm.flux.math import apply_rope1 as apply_rope_comfy1
 from comfy.ldm.flux.math import apply_rope as apply_rope_comfy
 from comfy import model_management as mm
+try:
+    from comfy.ldm.flux.math import rope
+except ImportError:
+    def rope(pos: torch.Tensor, dim: int, theta: int) -> torch.Tensor:
+        assert dim % 2 == 0
+        scale = torch.arange(0, dim, 2, dtype=torch.float64, device=pos.device) / dim
+        omega = 1.0 / (theta**scale)
+        out = torch.einsum("...n,d->...nd", pos.to(dtype=torch.float32), omega)
+        out = torch.stack([torch.cos(out), -torch.sin(out), torch.sin(out), torch.cos(out)], dim=-1)
+        out = out.reshape(*out.shape[:-1], 2, 2)
+        return out.to(dtype=torch.float32, device=pos.device)
 
 __all__ = ['WanModel']
 
@@ -2206,7 +2217,7 @@ class WanModel(torch.nn.Module):
 
     def rope_encode_comfy(self, t, h, w, freq_offset=0, t_start=0, ref_frame_shape=None, pose_frame_shape=None,
                           steps_t=None, steps_h=None, steps_w=None, ntk_alphas=[1,1,1], device=None, dtype=None,
-                          ref_frame_index=10, longcat_num_ref_latents=0, num_memory_frames=3, rope_negative_offset=0):
+                          ref_frame_index=10, longcat_num_ref_latents=0, num_memory_frames=3, rope_negative_offset=0,source_id=0):
 
         patch_size = self.patch_size
         t_len = ((t + (patch_size[0] // 2)) // patch_size[0])
@@ -2300,7 +2311,16 @@ class WanModel(torch.nn.Module):
             pose_freqs = pose_freqs.permute(0, 1, 6, 7, 2, 3, 4, 5).reshape(B, -1, heads, dim, 2, 2)
 
             freqs = torch.cat([main_freqs, pose_freqs], dim=1)
-
+        # 【在 return freqs 之前，添加以下 Bernini 专属的 RoPE 旋转逻辑】
+        #####qwen3.7
+        if source_id > 0:
+            d = self.dim // self.num_heads
+            pos = torch.tensor([[float(source_id)]], device=freqs.device, dtype=torch.float32)
+            # 使用导入的 rope 函数计算旋转矩阵
+            id_rot = rope(pos, d, self.rope_embedder.theta).reshape(1, 1, 1, d//2, 2, 2).to(freqs.dtype)
+            # 将旋转应用到 spatial rope 上
+            freqs = torch.einsum('...ij,...jk->...ik', freqs, id_rot)
+        #####qwen3.7
         return freqs
 
 
@@ -2350,6 +2370,7 @@ class WanModel(torch.nn.Module):
         transformer_options={},
         rope_negative_offset=0,
         num_memory_frames=0,
+        context_latents=None,  # <--- 【新增】支持 Bernini context latents
     ):
         r"""
         Forward pass through the diffusion model
@@ -2575,6 +2596,25 @@ class WanModel(torch.nn.Module):
         f, h, w = x[0].shape[2:]
         x = [u.flatten(2).transpose(1, 2) for u in x]
         self.original_seq_len = x[0].shape[1]
+            # 【在其下方立即添加以下代码】   qwen3.7新增部分
+        main_len = self.original_seq_len  # 记录主序列长度，用于最后裁剪
+
+        if context_latents is not None:
+            for lat in context_latents:
+                if lat.dim() == 4:
+                    lat = lat.unsqueeze(0)
+                # Patch embed the context latent
+                cl = self.original_patch_embedding(lat.to(torch.float32)).to(x[0].dtype)
+                cl = cl.flatten(2).transpose(1, 2)
+                
+                # 【修正】：直接拼接，不需要任何 Padding！
+                # Transformer 原生支持变长序列，且 rope_encode_comfy 已经为每个 context latent 
+                # 生成了精确对应其 Token 数量的 freqs，直接 cat 即可保证 x 和 freqs 长度一致。
+                x = [torch.cat([_x, cl], dim=1) for _x in x]
+            
+            # 更新 seq_len 以反映拼接后的真实总长度
+            seq_len = x[0].shape[1]
+        ##############   qwen3.7新增部分
 
         prev_latent = None
         if dual_control_input is not None:
@@ -2664,6 +2704,9 @@ class WanModel(torch.nn.Module):
 
         # region rope freqs
         if freqs is None and "comfy" in self.rope_func: #comfy rope
+            # 找到主 freqs 生成逻辑的结尾处 (在 if freqs is None and "comfy" in self.rope_func: 块内部或紧接着其后)
+            # 确保在主 freqs 已经赋值后，添加以下逻辑:
+
             # Create cache key from all relevant parameters
             cache_key = (
                 F, H, W,
@@ -2711,6 +2754,25 @@ class WanModel(torch.nn.Module):
                 # Store cache with key
                 self.cached_freqs = freqs
                 self.cached_key = cache_key
+            #########qwen3.7新增部分
+            if context_latents is not None:
+                for i, lat in enumerate(context_latents):
+                    if lat.dim() == 4:
+                        lat = lat.unsqueeze(0)
+                    F_c, H_c, W_c = lat.shape[2], lat.shape[3], lat.shape[4]
+                    
+                    # 为每个 context latent 生成独立的 RoPE，source_id 从 1 开始递增
+                    freqs_c = self.rope_encode_comfy(
+                        F_c, H_c, W_c,
+                        source_id=i + 1,  # <--- 关键：非零 source_id 触发额外旋转
+                        freq_offset=freq_offset,
+                        ntk_alphas=ntk_alphas,
+                        device=x[0].device,
+                        dtype=x[0].dtype
+                    )
+                    # 将 context 的 freqs 拼接到主 freqs 后面
+                    freqs = torch.cat([freqs, freqs_c], dim=1)
+                    #########qwen3.7新增部分
 
         # Stand-In RoPE frequencies
         if x_ip is not None:
@@ -3395,6 +3457,12 @@ class WanModel(torch.nn.Module):
 
         x = self.head(x, e.to(x.device), temp_length=F,
                       e_tr=e_token_replace.to(x.device) if use_token_replace else None, tr_start=token_replace_start, tr_num=replace_token_num)
+        # 【在其下方立即添加裁剪逻辑】
+        ########qwen3.7
+        if context_latents is not None:
+            # 裁剪掉 context latents 对应的输出部分，只保留主序列的预测结果
+            x = x[:, :main_len]
+        ########qwen3.7
 
         if x_ovi is not None:
             x_ovi = self.audio_model.head(x_ovi, e_ovi.to(x_ovi.device))
